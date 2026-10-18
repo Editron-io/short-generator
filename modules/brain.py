@@ -1,138 +1,128 @@
-import os
-import json
-from google import genai
-from dotenv import load_dotenv
+"""Module 1 — Trend/hook engine. Emits a chaptered storyboard."""
+import json, logging, re
+import config
 
-load_dotenv()
+log = logging.getLogger(__name__)
 
-def _get_client():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set. Create a .env file or set the environment variable before running.")
-    return genai.Client(api_key=api_key)
+SYSTEM = """You are the head writer for a Speculative Fiction audio-documentary
+channel in the style of declassified government archives and analog horror.
+Output ONLY minified JSON. No markdown fences. No prose. No commentary.
+Tone: bureaucratic, restrained, unsettling. Never gory. Never name real
+living people. Frame everything as fiction."""
 
-def _get_model_cascade():
-    """
-    Returns the robust cascading model fallback order based on user preferences.
-    Tries the .env file value first, then systematically downgrades to protect uptime.
-    """
-    env_model = os.getenv('GEMINI_MODEL', 'gemini-3.5-flash')
-    return [
-        env_model,                # Tier 1: User choice (e.g. gemini-3.5-flash)
-        "gemini-3.5-flash-lite",  # Tier 2: Cost & speed optimized fallback
-        "gemini-3.0-flash"        # Tier 3: High-capacity universal backup fallback
-    ]
+CHAPTER_PROMPT = """Write chapter {ch} of {total} of an original fictional report.
+
+Chapter brief: {brief}
+
+Requirements:
+- Exactly {n} segments.
+- Each "narration": 8-20 words, a 4-6 second read at documentary pace.
+- Each "visual_keyword": 2-4 words, a concrete filmable or archival image
+  ("concrete bunker fog", "1970s radar array", "empty county road night").
+- Narration must flow from prior chapter. End each chapter on a hook.
+
+Return ONLY this JSON shape:
+{{"summary":"one sentence recap of this chapter","segments":[{{"narration":"...","visual_keyword":"..."}}]}}"""
+
+BRIEFS = [
+    "The first anomaly report. A routine survey that went unexplained.",
+    "The agency reopens the file. Contradicting evidence in the margins.",
+    "A witness comes forward. Their account does not match the record.",
+    "The geographic anomaly expands. Instruments fail in specific patterns.",
+    "The incident is quietly reclassified. A secondary site is found.",
+    "The archive closes. One final fragment survives.",
+]
+
+
+def _clean(raw: str) -> str:
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+    i, j = raw.find("{"), raw.rfind("}")
+    if i == -1 or j == -1:
+        raise ValueError("no JSON object in response")
+    return raw[i:j + 1]
+
+
+def _split_long(text: str, keyword: str) -> list[dict]:
+    """Split a segment whose narration exceeds MAX_WORDS, on punctuation."""
+    words = text.split()
+    out = []
+    while len(words) > config.MAX_WORDS:
+        cut = config.MAX_WORDS
+        for k in range(len(words[:cut]) - 1, max(len(words[:cut]) - 7, 0), -1):
+            if words[k].endswith((".", "!", "?", ";", ",")):
+                cut = k + 1
+                break
+        out.append({"narration": " ".join(words[:cut]), "visual_keyword": keyword})
+        words = words[cut:]
+    if words:
+        out.append({"narration": " ".join(words), "visual_keyword": keyword})
+    return out
+
 
 class ContentBrain:
-    def get_trending_topic(self):
-        """
-        In a full build, this would scrape Google Trends or Twitter.
-        For now, we ask Gemini to pick a viral niche topic using a model fallback loop.
-        """
-        prompts = "Give me 1 specific, viral, and engaging topic for a Short Documentary. It should be a 'Engaging Did you know' fact or a 'Fun/intriguing Engaging News'. return ONLY the topic name."
-        client = _get_client()
-        models_to_try = _get_model_cascade()
-        
-        for model_name in models_to_try:
+    def __init__(self):
+        if not config.GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is not set")
+        from google import genai
+        self._client = genai.Client(api_key=config.GEMINI_API_KEY)
+
+    def _call(self, prompt: str) -> str:
+        last = None
+        for model in config.GEMINI_MODEL_CHAIN:
             try:
-                print(f"🤖 Attempting topic selection with {model_name}...")
-                response = client.models.generate_content(
-                    model=model_name, 
-                    contents=prompts
+                log.info("brain: trying %s", model)
+                r = self._client.models.generate_content(model=model, contents=prompt)
+                return r.text or ""
+            except Exception as e:                       # noqa: BLE001
+                last = e
+                log.warning("brain: %s failed: %s", model, e)
+        raise RuntimeError(f"all Gemini models failed: {last}")
+
+    def generate_storyboard(self) -> dict:
+        segs: list[dict] = []
+        prev_summary = "This is the opening chapter of the report."
+
+        for ch in range(config.NUM_CHAPTERS):
+            brief = BRIEFS[ch % len(BRIEFS)]
+            prompt = (
+                SYSTEM + "\n\n"
+                + CHAPTER_PROMPT.format(
+                    ch=ch + 1, total=config.NUM_CHAPTERS,
+                    n=config.CHAPTER_SIZE, brief=brief,
                 )
-                topic = response.text.strip()
-                print(f"🎯 Selected Topic: {topic} (Generated by {model_name})")
-                return topic
-            except Exception as e:
-                print(f"⚠️ {model_name} failed during topic selection: {str(e)}")
-                print("🔄 Falling back to the next model in the chain...")
-                continue
-                
-        raise RuntimeError("❌ [Critical Error] All Gemini models in the pipeline failed to fetch a trending topic.")
+                + f"\n\nPrior chapter recap: {prev_summary}"
+            )
+            raw = _clean(self._call(prompt))
+            chapter = json.loads(raw)
+            for s in chapter.get("segments", []):
+                n = " ".join(str(s.get("narration", "")).split())
+                kw = " ".join(str(s.get("visual_keyword", "dark static")).split()) or "dark static"
+                if n:
+                    segs.extend(_split_long(n, kw))
+            prev_summary = chapter.get("summary", prev_summary)
+            log.info("brain: chapter %d/%d done (%d segments total)",
+                     ch + 1, config.NUM_CHAPTERS, len(segs))
 
-    def generate_script(self, topic):
-        """
-        Generates a structured JSON script with visual cues using model fallback loops.
-        """
-        print(f"📝 Preparing to write script for: {topic}...")
-        prompt = f"""
-    You are the lead scriptwriter for a high-retention "Edutainment" YouTube Shorts channel.
-    Topic: {topic}
+        if len(segs) < 20:
+            raise RuntimeError(f"storyboard too short after coercion: {len(segs)} segments")
 
-    ### GOAL:
-    Create a script where every sentence has a "Visual Switch". 
-    To keep retention high, we need TWO different stock videos for every single scene.
+        meta_prompt = (
+            SYSTEM
+            + "\n\nGenerate YouTube metadata for this documentary. "
+            "Return ONLY minified JSON: "
+            '{"title":str,"description":str,"tags":[str]}. '
+            f"First 3 narration lines: {' | '.join(s['narration'] for s in segs[:3])}"
+        )
+        try:
+            meta = json.loads(_clean(self._call(meta_prompt)))
+        except Exception:                                # noqa: BLE001
+            meta = {"title": "Declassified: Anomaly Report",
+                    "description": "", "tags": []}
 
-    ### 1. SCRIPT REQUIREMENTS (The Voiceover):
-    - **Perspective:** Strictly **3rd Person** ("Scientists found...", "The ocean hides...").
-    - **Tone:** Engaging, fast-paced, logical. No fluff.
-    - **Structure:** 8-9 Scenes total.
-    - **Flow:** Hook -> Context -> Mechanism (How it works) -> Twist -> Outro.
-
-    ### 2. VISUAL REQUIREMENTS (Dual Visuals):
-    - For EVERY scene, provide TWO distinct search terms:
-      - **visual_1:** Matches the *start* of the sentence.
-      - **visual_2:** Matches the *end* of the sentence or provides a reaction/context.
-    - **Strictly Literal:** If the text is "The economy crashed," do NOT search "sad man". Search "Stock market red chart".
-
-    ### OUTPUT FORMAT (Strict JSON):
-    [
-        {{
-            "id": 1,
-            "text": "In 1995, fourteen wolves were released into Yellowstone Park, and they changed the rivers.",
-            "visual_1": "wolves running snow aerial",
-            "visual_2": "river flowing forest drone",
-            "mood": "intriguing" 
-        }},
-        {{
-            "id": 2,
-            "text": "It sounds impossible, but the biology is actually simple math.",
-            "visual_1": "person shocked looking at camera",
-            "visual_2": "blackboard math equations chalk",
-            "mood": "educational"
-        }}
-    ]
-    """
-        client = _get_client()
-        models_to_try = _get_model_cascade()
-        
-        for model_name in models_to_try:
-            try:
-                print(f"🤖 Attempting script generation with {model_name}...")
-                response = client.models.generate_content(
-                    model=model_name, 
-                    contents=prompt
-                )
-                
-                # Clean the response to ensure it's valid JSON (sometimes AI adds markdown)
-                clean_text = response.text.replace('```json', '').replace('```', '').strip()
-                
-                script_data = json.loads(clean_text)
-                print(f"✨ Successfully generated and parsed script using {model_name}!")
-                return script_data
-                
-            except json.JSONDecodeError:
-                print(f"❌ JSON parsing failed for model output from {model_name}.")
-                print("🔄 Falling back to the next model to attempt a cleaner format...")
-                continue
-            except Exception as e:
-                print(f"⚠️ {model_name} failed during script generation: {str(e)}")
-                print("🔄 Falling back to the next model in the chain...")
-                continue
-                
-        raise RuntimeError("❌ [Critical Error] All Gemini models failed to generate a parseable video script.")
-        
-# --- TESTING THE MODULE ---
-if __name__ == "__main__":
-    brain = ContentBrain()
-    try:
-        topic = brain.get_trending_topic()
-        script = brain.generate_script(topic)
-        
-        if script:
-            # Save to file to verify
-            with open("script.json", "w") as f:
-                json.dump(script, f, indent=4)
-                print("✅ Script saved to script.json")
-    except Exception as error:
-        print(f"💥 Pipeline Execution Crashed: {str(error)}")
+        return {
+            "title": str(meta.get("title", "Declassified: Anomaly Report"))[:100],
+            "description": str(meta.get("description", "")),
+            "tags": [str(t) for t in (meta.get("tags") or [])][:35],
+            "segments": segs,
+        }
