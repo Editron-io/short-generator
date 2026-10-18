@@ -1,70 +1,74 @@
-import os
-import asyncio
+"""Module 2 — Narration synthesis + per-segment timeline."""
+import asyncio, json, logging, subprocess
+from pathlib import Path
 import edge_tts
-from mutagen.mp3 import MP3
+import config
+
+log = logging.getLogger(__name__)
+
+
+def _probe(path: Path) -> float:
+    out = subprocess.run(
+        [config.ffprobe_bin(), "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    return float(out)
+
 
 class AudioEngine:
-    def __init__(self, voice="en-US-AvaNeural"):
+    def __init__(self, voice: str = config.EDGE_VOICE):
         self.voice = voice
-        self.output_dir = os.path.join(os.getcwd(), "assets", "audio_clips")
-        os.makedirs(self.output_dir, exist_ok=True)
 
-    async def generate_audio(self, text, output_filename, retries=3):
-        """
-        Generates MP3 with retry logic to handle connection drops.
-        """
-        output_path = os.path.join(self.output_dir, output_filename)
-        
-        for attempt in range(retries):
-            try:
-                # Rate +10% for engagement
-                communicate = edge_tts.Communicate(text, self.voice, rate="+10%")
-                await communicate.save(output_path)
-                return output_path
-            
-            except Exception as e:
-                print(f"      ⚠️ Audio Error (Attempt {attempt+1}/{retries}): {e}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(2) # Wait 2 seconds before retrying
-                else:
-                    print("      ❌ Failed to generate audio after max retries.")
-                    raise e # Re-raise error if all retries fail
+    async def _synth(self, text: str, out: Path) -> None:
+        await edge_tts.Communicate(text, self.voice, rate="+0%").save(str(out))
 
-    def get_audio_duration(self, file_path):
-        try:
-            audio = MP3(file_path)
-            return audio.info.length
-        except Exception as e:
-            print(f"❌ Error reading audio length: {e}")
-            return 0.0
+    def process_storyboard(self, storyboard: dict) -> dict:
+        segments = storyboard["segments"]
+        wavs: list[Path] = []
+        cues: list[dict] = []
+        cursor = 0.0
 
-    async def process_script(self, script_data):
-        print(f"🎙️ Starting Audio Generation for {len(script_data)} scenes...")
-        
-        for scene in script_data:
-            scene_id = scene['id']
-            text = scene['text']
-            filename = f"voice_{scene_id}.mp3"
-            
-            try:
-                # Generate Audio
-                file_path = await self.generate_audio(text, filename)
-                
-                # Get Duration
-                duration = self.get_audio_duration(file_path)
-                
-                # Update Scene Data
-                scene['audio_path'] = file_path
-                scene['duration'] = duration
-                
-                print(f"   ✅ Scene {scene_id}: {duration:.2f}s generated.")
-                
-                # CRITICAL: Sleep for 1 second to be polite to the API
-                # This prevents the "Connection Timeout" error
-                await asyncio.sleep(1) 
-                
-            except Exception as e:
-                print(f"   ❌ Skipping Scene {scene_id} due to audio error.")
-                continue
-            
-        return script_data
+        for i, seg in enumerate(segments):
+            mp3 = config.AUDIO / f"seg_{i:04d}.mp3"
+            if not mp3.exists():
+                asyncio.run(self._synth(seg["narration"], mp3))
+            dur = _probe(mp3)
+            cues.append({
+                "start": round(cursor, 3),
+                "end": round(cursor + dur, 3),
+                "text": seg["narration"],
+            })
+            cursor += dur
+
+            wav = config.AUDIO / f"seg_{i:04d}.wav"
+            if not wav.exists():
+                subprocess.run(
+                    [config.ffmpeg_bin(), "-y", "-i", str(mp3),
+                     "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)],
+                    check=True, capture_output=True,
+                )
+            wavs.append(wav)
+
+        listfile = config.AUDIO / "audio_list.txt"
+        listfile.write_text("".join(f"file '{w.name}'\n" for w in wavs),
+                            encoding="utf-8")
+
+        master = config.AUDIO / "master.wav"
+        subprocess.run(
+            [config.ffmpeg_bin(), "-y", "-f", "concat", "-safe", "0",
+             "-i", listfile.name,
+             "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=24000",
+             "-c:a", "pcm_s16le", str(master)],
+            check=True, capture_output=True, cwd=config.AUDIO,
+        )
+
+        timeline = {
+            "master_audio": str(master),
+            "duration": _probe(master),
+            "cues": cues,
+        }
+        (config.AUDIO / "timeline.json").write_text(
+            json.dumps(timeline, indent=2), encoding="utf-8")
+        log.info("audio: %.1fs across %d segments", timeline["duration"], len(cues))
+        return timeline
