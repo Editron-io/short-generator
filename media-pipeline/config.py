@@ -27,10 +27,11 @@ FPS = 30
 GEMINI_MODEL_CHAIN = [
     m.strip() for m in os.getenv(
         "GEMINI_MODEL_CHAIN",
-        "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash",
+        "gemini-3.5-flash,"
+        "gemini-3.5-flash-lite,"
+        "gemini-3-flash-preview",
     ).split(",") if m.strip()
 ]
-
 # ---- TTS -----------------------------------------------------------------
 EDGE_VOICE = os.getenv("EDGE_VOICE", "en-US-ChristopherNeural")
 
